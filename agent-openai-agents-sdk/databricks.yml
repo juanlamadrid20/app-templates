@@ -1,37 +1,60 @@
 bundle:
   name: agent_openai_agents_sdk
 
+variables:
+  app_name:
+    description: "Base name of the Databricks app"
+    default: "agent-openai-agents-sdk"
+
+sync:
+  exclude:
+    - .git
+    - .venv
+    - .databricks
+    - .claude
+    - __pycache__
+    - "*.pyc"
+    - .DS_Store
+    - .env
+    - node_modules
+
 resources:
-  # MLflow experiment for agent tracing - automatically created by bundle
+
   experiments:
     agent_openai_agents_sdk_experiment:
       name: /Users/${workspace.current_user.userName}/${bundle.name}-${bundle.target}
 
   apps:
     agent_openai_agents_sdk:
-      name: "${bundle.target}-agent-openai-agents-sdk"
+      name: "${var.app_name}"
       description: "OpenAI Agents SDK agent application"
       source_code_path: ./
+      user_api_scopes:
+        - sql
 
-      # Resources which this app has access to
       resources:
         - name: 'experiment'
           experiment:
             experiment_id: "${resources.experiments.agent_openai_agents_sdk_experiment.id}"
             permission: 'CAN_MANAGE'
+        - name: 'customer_reviews_vector_index'
+          uc_securable:
+            securable_full_name: 'juan_use1_catalog.retail.gold_customer_reviews_idx'
+            securable_type: 'TABLE'
+            permission: 'SELECT'
 
 targets:
-  dev:
+
+  fevm:
     mode: development
     default: true
-    # workspace:
-    #   host: https://...
+    workspace:
+      host: https://fevm-juan-use1.cloud.databricks.com
+    presets:
+      source_linked_deployment: true
 
   prod:
     mode: production
-    # workspace:
-    #   host: https://...
-    resources:
-      apps:
-        agent_openai_agents_sdk:
-          name: agent-openai-agents-sdk
+    run_as:
+      # TODO: replace with your production service principal
+      service_principal_name: "<service-principal-name>"

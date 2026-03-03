@@ -22,7 +22,6 @@ agent = Agent(
     mcp_servers=[custom_mcp],
 )
 ```
-
 ### 2. Deploy your agent app first
 
 ```bash
