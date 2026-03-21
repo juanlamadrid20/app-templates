@@ -106,6 +106,59 @@ def load_tools(mcp_server):
         except Exception as e:
             return {"error": str(e), "message": "Failed to retrieve user information"}
 
-    """
-    TODO: Add more tools as necessary
-    """
+    @mcp_server.tool
+    def list_clusters(limit: int = 25) -> dict:
+        """
+        List Databricks clusters in the workspace.
+
+        Returns a summary of clusters (all-purpose, job, etc.) with their name, id,
+        state, and runtime. Uses app-level (service principal) authentication, so
+        it reflects what the app can see in the workspace, not just the current user's
+        clusters.
+
+        Useful for:
+        - Discovering available compute for running notebooks or jobs
+        - Checking cluster state (running, terminated, etc.) before running workloads
+        - Helping users choose or start a cluster
+
+        Args:
+            limit: Maximum number of clusters to return (default 25). Use to avoid
+                   large responses in workspaces with many clusters.
+
+        Returns:
+            dict: A dictionary containing:
+                - clusters (list): List of cluster summaries, each with:
+                    - cluster_id (str): Unique cluster identifier
+                    - name (str): Cluster name
+                    - state (str): Current state (e.g. RUNNING, TERMINATED)
+                    - spark_version (str): DBR version
+                - count (int): Number of clusters returned
+
+        Example response:
+            {
+                "clusters": [
+                    {
+                        "cluster_id": "1234-567890-abc123",
+                        "name": "my-cluster",
+                        "state": "RUNNING",
+                        "spark_version": "14.3.x-scala2.12"
+                    }
+                ],
+                "count": 1
+            }
+        """
+        try:
+            w = utils.get_workspace_client()
+            clusters = []
+            for i, c in enumerate(w.clusters.list()):
+                if i >= limit:
+                    break
+                clusters.append({
+                    "cluster_id": c.cluster_id,
+                    "name": c.cluster_name or "(unnamed)",
+                    "state": getattr(c.state, "value", str(c.state)) if c.state else "UNKNOWN",
+                    "spark_version": c.spark_version or "—",
+                })
+            return {"clusters": clusters, "count": len(clusters)}
+        except Exception as e:
+            return {"error": str(e), "message": "Failed to list clusters", "clusters": [], "count": 0}
