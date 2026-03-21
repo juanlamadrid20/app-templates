@@ -1,11 +1,13 @@
+import logging
 import os
+from datetime import datetime
 from typing import AsyncGenerator
 
-from uuid_utils import uuid7
-
+import litellm
 import mlflow
-from agents import Agent, Runner, set_default_openai_api, set_default_openai_client
+from agents import Agent, Runner, function_tool, set_default_openai_api, set_default_openai_client
 from agents.tracing import set_trace_processors
+from databricks.sdk import WorkspaceClient
 from databricks_openai import AsyncDatabricksOpenAI
 from databricks_openai.agents import AsyncDatabricksSession, McpServer
 from mlflow.genai.agent_server import invoke, stream
@@ -14,104 +16,123 @@ from mlflow.types.responses import (
     ResponsesAgentResponse,
     ResponsesAgentStreamEvent,
 )
-
 from agent_server.utils import (
     deduplicate_input,
     get_databricks_host_from_env,
+    get_session_id,
     get_user_workspace_client,
     process_agent_stream_events,
     resolve_lakebase_instance_name,
-    sanitize_output_items,
 )
 
-# Lakebase instance name for persistent session storage
-_LAKEBASE_INSTANCE_NAME_RAW = os.environ.get("LAKEBASE_INSTANCE_NAME")
-if not _LAKEBASE_INSTANCE_NAME_RAW:
+# Lakebase configuration for persistent session storage
+_LAKEBASE_INSTANCE_NAME_RAW = os.environ.get("LAKEBASE_INSTANCE_NAME") or None
+LAKEBASE_AUTOSCALING_PROJECT = os.getenv("LAKEBASE_AUTOSCALING_PROJECT") or None
+LAKEBASE_AUTOSCALING_BRANCH = os.getenv("LAKEBASE_AUTOSCALING_BRANCH") or None
+
+_has_autoscaling = LAKEBASE_AUTOSCALING_PROJECT and LAKEBASE_AUTOSCALING_BRANCH
+if not _LAKEBASE_INSTANCE_NAME_RAW and not _has_autoscaling:
     raise ValueError(
-        "LAKEBASE_INSTANCE_NAME environment variable is required but not set. "
-        "Please set it in your environment:\n"
-        "  LAKEBASE_INSTANCE_NAME=<your-lakebase-instance-name>\n"
+        "Lakebase configuration is required but not set. "
+        "Please set one of the following in your environment:\n"
+        "  Option 1 (provisioned): LAKEBASE_INSTANCE_NAME=<your-instance-name>\n"
+        "  Option 2 (autoscaling): LAKEBASE_AUTOSCALING_PROJECT=<project> and LAKEBASE_AUTOSCALING_BRANCH=<branch>\n"
     )
 # Resolve hostname to instance name if needed (if given hostname of lakebase instead of name)
-LAKEBASE_INSTANCE_NAME = resolve_lakebase_instance_name(_LAKEBASE_INSTANCE_NAME_RAW)
+LAKEBASE_INSTANCE_NAME = resolve_lakebase_instance_name(_LAKEBASE_INSTANCE_NAME_RAW) if _LAKEBASE_INSTANCE_NAME_RAW else None
 
-
-def get_session_id(request: ResponsesAgentRequest) -> str:
-    """Extract session_id from request or generate a new one."""
-    # Priority:
-    # 1. Use session_id from custom_inputs
-    # 2. Use conversation_id from ChatContext
-    #    https://mlflow.org/docs/latest/api_reference/python_api/mlflow.types.html#mlflow.types.agent.ChatContext
-    # 3. Generate a new UUID
-    ci = dict(request.custom_inputs or {})
-
-    if "session_id" in ci and ci["session_id"]:
-        return str(ci["session_id"])
-
-    if request.context and getattr(request.context, "conversation_id", None):
-        return str(request.context.conversation_id)
-
-    return str(uuid7())
 
 # NOTE: this will work for all databricks models OTHER than GPT-OSS, which uses a slightly different API
 set_default_openai_client(AsyncDatabricksOpenAI())
 set_default_openai_api("chat_completions")
 set_trace_processors([])  # only use mlflow for trace processing
 mlflow.openai.autolog()
+logging.getLogger("mlflow.utils.autologging_utils").setLevel(logging.ERROR)
+litellm.suppress_debug_info = True
 
 
-async def init_mcp_server():
+@function_tool
+def get_current_time() -> str:
+    """Get the current date and time."""
+    return datetime.now().isoformat()
+
+
+async def init_mcp_server(workspace_client: WorkspaceClient):
     return McpServer(
         url=f"{get_databricks_host_from_env()}/api/2.0/mcp/functions/system/ai",
         name="system.ai uc function mcp server",
+        workspace_client=workspace_client,
     )
 
 
-def create_coding_agent(mcp_server: McpServer) -> Agent:
+def create_agent(mcp_servers: list[McpServer] | None = None) -> Agent:
     return Agent(
-        name="code execution agent",
-        instructions="You are a code execution agent. You can execute code and return the results.",
+        name="Agent",
+        instructions="You are a helpful assistant.",
         model="databricks-gpt-5-2",
-        mcp_servers=[mcp_server],
+        tools=[get_current_time],
+        mcp_servers=mcp_servers or [],
     )
 
 
 @invoke()
 async def invoke_handler(request: ResponsesAgentRequest) -> ResponsesAgentResponse:
-    # Optionally use the user's workspace client for on-behalf-of authentication
-    # user_workspace_client = get_user_workspace_client()
-
     # Create session for stateful, short-term conversation history with your Databricks Lakebase instance
+    session_id = get_session_id(request)
+    if session_id:
+        mlflow.update_current_trace(metadata={"mlflow.trace.session": session_id})
     session = AsyncDatabricksSession(
-        session_id=get_session_id(request),
+        session_id=session_id,
         instance_name=LAKEBASE_INSTANCE_NAME,
+        project=LAKEBASE_AUTOSCALING_PROJECT,
+        branch=LAKEBASE_AUTOSCALING_BRANCH,
     )
 
-    async with await init_mcp_server() as mcp_server:
-        agent = create_coding_agent(mcp_server)
-        messages = await deduplicate_input(request, session)
-        result = await Runner.run(agent, messages, session=session)
-        return ResponsesAgentResponse(
-            output=sanitize_output_items(result.new_items),
-            custom_outputs={"session_id": session.session_id},
-        )
+    # To use MCP server tools, wrap the code below with this async context manager.
+    # By default, uses service principal credentials via WorkspaceClient().
+    # For on-behalf-of user authentication, use get_user_workspace_client() instead.
+    # try:
+    #     async with await init_mcp_server(WorkspaceClient()) as mcp_server:
+    #         agent = create_agent(mcp_servers=[mcp_server])
+    # except Exception:
+    #     logger.warning("MCP server unavailable. Continuing without MCP tools.", exc_info=True)
+    #     agent = create_agent()
+    agent = create_agent()
+    messages = await deduplicate_input(request, session)
+    result = await Runner.run(agent, messages, session=session)
+    return ResponsesAgentResponse(
+        output=[item.to_input_item() for item in result.new_items],
+        custom_outputs={"session_id": session.session_id},
+    )
 
 
 @stream()
-async def stream_handler(request: ResponsesAgentRequest) -> AsyncGenerator[ResponsesAgentStreamEvent, None]:
-    # Optionally use the user's workspace client for on-behalf-of authentication
-    # user_workspace_client = get_user_workspace_client()
-
+async def stream_handler(
+    request: ResponsesAgentRequest,
+) -> AsyncGenerator[ResponsesAgentStreamEvent, None]:
     # Create session for stateful, short-term conversation history with your Databricks Lakebase instance
+    session_id = get_session_id(request)
+    if session_id:
+        mlflow.update_current_trace(metadata={"mlflow.trace.session": session_id})
     session = AsyncDatabricksSession(
-        session_id=get_session_id(request),
+        session_id=session_id,
         instance_name=LAKEBASE_INSTANCE_NAME,
+        project=LAKEBASE_AUTOSCALING_PROJECT,
+        branch=LAKEBASE_AUTOSCALING_BRANCH,
     )
 
-    async with await init_mcp_server() as mcp_server:
-        agent = create_coding_agent(mcp_server)
-        messages = await deduplicate_input(request, session)
-        result = Runner.run_streamed(agent, input=messages, session=session)
+    # To use MCP server tools, wrap the code below with this async context manager.
+    # By default, uses service principal credentials via WorkspaceClient().
+    # For on-behalf-of user authentication, use get_user_workspace_client() instead.
+    # try:
+    #     async with await init_mcp_server(WorkspaceClient()) as mcp_server:
+    #         agent = create_agent(mcp_servers=[mcp_server])
+    # except Exception:
+    #     logger.warning("MCP server unavailable. Continuing without MCP tools.", exc_info=True)
+    #     agent = create_agent()
+    agent = create_agent()
+    messages = await deduplicate_input(request, session)
+    result = Runner.run_streamed(agent, input=messages, session=session)
 
-        async for event in process_agent_stream_events(result.stream_events()):
-            yield event
+    async for event in process_agent_stream_events(result.stream_events()):
+        yield event

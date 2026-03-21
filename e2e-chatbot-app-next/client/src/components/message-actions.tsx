@@ -1,24 +1,16 @@
 import { useCopyToClipboard } from 'usehooks-ts';
 
 import { Actions, Action } from './elements/actions';
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from '@/components/ui/tooltip';
-import { memo, useState, useCallback, useRef } from 'react';
+import { memo, useState, useCallback, useRef, useEffect } from 'react';
 import { toast } from 'sonner';
 import type { ChatMessage, Feedback } from '@chat-template/core';
 import { useAppConfig } from '@/contexts/AppConfigContext';
 import {
   ChevronDown,
   ChevronUp,
-  CopyIcon,
-  PencilLineIcon,
-  ThumbsUp,
-  ThumbsDown,
 } from 'lucide-react';
+import { DbIcon } from './ui/db-icon';
+import { PencilIcon, CopyIcon, ThumbsUpIcon, ThumbsDownIcon } from './icons';
 
 function PureMessageActions({
   message,
@@ -44,6 +36,15 @@ function PureMessageActions({
     initialFeedback?.feedbackType || null,
   );
   const isSubmittingRef = useRef(false);
+
+  // Sync server-restored feedback into local state when it arrives after mount
+  // (e.g. NewChatPage's useChatData resolves after the first stream completes).
+  // Only applies when the user hasn't clicked anything yet (feedback === null).
+  useEffect(() => {
+    if (initialFeedback?.feedbackType && feedback === null) {
+      setFeedback(initialFeedback.feedbackType);
+    }
+  }, [initialFeedback?.feedbackType]);
 
   const textFromParts = message.parts
     ?.filter((part) => part.type === 'text')
@@ -83,7 +84,7 @@ function PureMessageActions({
         setFeedback(feedbackType);
       } catch (error) {
         console.error('Error submitting feedback:', error);
-        toast.error('Failed to submit feedback. Please try again.');
+        toast.error('Failed to submit feedback. Please try again, or contact the app developer if the error persists.');
       } finally {
         isSubmittingRef.current = false;
       }
@@ -108,26 +109,26 @@ function PureMessageActions({
   if (message.role === 'user') {
     return (
       <Actions className="-mr-0.5 justify-end">
-        <div className="relative">
+        <div className="relative flex items-center gap-1">
           {setMode && (
             <Action
               tooltip="Edit"
               onClick={() => setMode('edit')}
-              className="-left-10 absolute top-0 opacity-0 transition-opacity group-hover/message:opacity-100"
+              className="opacity-0 transition-opacity group-hover/message:opacity-100"
               data-testid="message-edit-button"
             >
-              <PencilLineIcon />
+              <DbIcon icon={PencilIcon} />
             </Action>
           )}
           <Action tooltip="Copy" onClick={handleCopy}>
-            <CopyIcon />
+            <DbIcon icon={CopyIcon} />
           </Action>
         </div>
       </Actions>
     );
   }
 
-  const feedbackButtons = feedbackSupported ? (
+  const feedbackButtons = (
     <>
       <Action
         tooltip="Thumbs up"
@@ -135,7 +136,7 @@ function PureMessageActions({
         className={feedback === 'thumbs_up' ? 'text-green-600' : ''}
         data-testid="thumbs-up-button"
       >
-        <ThumbsUp />
+        <DbIcon icon={ThumbsUpIcon} />
       </Action>
       <Action
         tooltip="Thumbs down"
@@ -143,37 +144,9 @@ function PureMessageActions({
         className={feedback === 'thumbs_down' ? 'text-red-600' : ''}
         data-testid="thumbs-down-button"
       >
-        <ThumbsDown />
+        <DbIcon icon={ThumbsDownIcon} />
       </Action>
     </>
-  ) : (
-    // Wrap disabled buttons in a span so the tooltip still shows on hover
-    // (disabled buttons have pointer-events:none and won't trigger tooltip).
-    <TooltipProvider>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <span className="flex items-center gap-1">
-            <Action
-              disabled
-              className="opacity-50"
-              data-testid="thumbs-up-button"
-            >
-              <ThumbsUp />
-            </Action>
-            <Action
-              disabled
-              className="opacity-50"
-              data-testid="thumbs-down-button"
-            >
-              <ThumbsDown />
-            </Action>
-          </span>
-        </TooltipTrigger>
-        <TooltipContent>
-          <p>Feedback not available for this endpoint</p>
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
   );
 
   return (
@@ -183,7 +156,7 @@ function PureMessageActions({
           <CopyIcon />
         </Action>
       )}
-      {feedbackEnabled && feedbackButtons}
+      {feedbackEnabled && feedbackSupported && feedbackButtons}
       {errorCount > 0 && onToggleErrors && (
         <Action
           tooltip={showErrors ? 'Hide errors' : 'Show errors'}

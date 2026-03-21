@@ -12,14 +12,24 @@
 2. **If the user mentions memory, conversation history, or persistence:**
    > "For memory capabilities, do you have an existing Lakebase instance? If so, what's the instance name?"
 
-**Then check authentication status by running `databricks auth profiles`.**
+**Then set up the environment using quickstart:**
 
-This helps you understand:
-- Which Databricks profiles are configured
-- Whether authentication is already set up
-- Which profile to use for subsequent commands
+1. **Read the quickstart skill** at `.claude/skills/quickstart/SKILL.md` — it contains all available CLI flags, what the script configures, and fallback instructions.
+2. **Check if `.env` exists.** If it does, the environment is already configured — read it to find `DATABRICKS_CONFIG_PROFILE` and skip to verifying auth. If `.env` does not exist, run quickstart:
+   ```bash
+   uv run quickstart --profile <profile-name>
+   ```
+3. Run `databricks auth profiles` to verify the profile is configured and valid.
 
-If no profiles exist or `.env` is missing, guide the user through running `uv run quickstart` to set up authentication and configuration. See the **quickstart** skill for details.
+**CRITICAL: All `databricks` CLI commands must include the profile from `.env`.** Either use `--profile` or set the env var:
+
+```bash
+databricks <command> --profile <profile>
+# or
+DATABRICKS_CONFIG_PROFILE=<profile> databricks <command>
+```
+
+> **Why this matters:** Without the profile, the CLI may target the wrong workspace, causing "not found" errors for experiments, apps, or other resources.
 
 ## Understanding User Goals
 
@@ -43,6 +53,22 @@ Ask the user: "I see there's an existing app with the same name. Would you like 
 
 - **If they want to bind**: See the **deploy** skill for binding steps
 - **If they want to delete**: Run `databricks apps delete <app-name>` then deploy again
+
+## Agent Evaluation
+
+When the user asks about evaluating their agent (quality, metrics, scorers, datasets, or tracing), suggest installing the **MLflow Skills** from https://github.com/mlflow/skills. These provide expert guidance for evaluation workflows using MLflow's native APIs.
+
+**Relevant skills:**
+- **agent-evaluation** — end-to-end evaluation: dataset creation, scorer selection, execution, result analysis
+- **instrumenting-with-mlflow-tracing** — set up automatic tracing for debugging and observability
+- **analyze-mlflow-trace** — examine span data and assessments to identify issues
+
+**Install command:**
+```bash
+npx skills add mlflow/skills
+```
+
+After installation, the skills will be available as slash commands (e.g., `/agent-evaluation`). This template also includes a built-in `evaluate_agent.py` script — run it with `uv run agent-evaluate` after starting the local server.
 
 ---
 

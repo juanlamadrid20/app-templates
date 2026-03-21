@@ -1,5 +1,6 @@
 import logging
 import os
+from datetime import datetime
 from typing import Any, AsyncGenerator, Optional
 
 import mlflow
@@ -12,6 +13,7 @@ from databricks_langchain import (
 )
 from fastapi import HTTPException
 from langchain.agents import create_agent
+from langchain_core.tools import tool
 from langgraph.store.base import BaseStore
 from mlflow.genai.agent_server import invoke, stream
 from mlflow.types.responses import (
@@ -40,25 +42,36 @@ logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 mlflow.langchain.autolog()
 sp_workspace_client = WorkspaceClient()
 
+
+@tool
+def get_current_time() -> str:
+    """Get the current date and time."""
+    return datetime.now().isoformat()
+
+
 ############################################
 # Configuration
 ############################################
 LLM_ENDPOINT_NAME = "databricks-claude-sonnet-4-5"
-_LAKEBASE_INSTANCE_NAME_RAW = os.getenv("LAKEBASE_INSTANCE_NAME", "")
+_LAKEBASE_INSTANCE_NAME_RAW = os.getenv("LAKEBASE_INSTANCE_NAME") or None
 EMBEDDING_ENDPOINT = "databricks-gte-large-en"
 EMBEDDING_DIMS = 1024
+LAKEBASE_AUTOSCALING_PROJECT = os.getenv("LAKEBASE_AUTOSCALING_PROJECT") or None
+LAKEBASE_AUTOSCALING_BRANCH = os.getenv("LAKEBASE_AUTOSCALING_BRANCH") or None
 
 ############################################
 
-if not _LAKEBASE_INSTANCE_NAME_RAW:
+_has_autoscaling = LAKEBASE_AUTOSCALING_PROJECT and LAKEBASE_AUTOSCALING_BRANCH
+if not _LAKEBASE_INSTANCE_NAME_RAW and not _has_autoscaling:
     raise ValueError(
-        "LAKEBASE_INSTANCE_NAME environment variable is required but not set. "
-        "Please set it in your environment:\n"
-        "  LAKEBASE_INSTANCE_NAME=<your-lakebase-instance-name>\n"
+        "Lakebase configuration is required but not set. "
+        "Please set one of the following in your environment:\n"
+        "  Option 1 (provisioned): LAKEBASE_INSTANCE_NAME=<your-instance-name>\n"
+        "  Option 2 (autoscaling): LAKEBASE_AUTOSCALING_PROJECT=<project> and LAKEBASE_AUTOSCALING_BRANCH=<branch>\n"
     )
 
 # Resolve hostname to instance name if needed (if given hostname of lakebase instead of name)
-LAKEBASE_INSTANCE_NAME = resolve_lakebase_instance_name(_LAKEBASE_INSTANCE_NAME_RAW)
+LAKEBASE_INSTANCE_NAME = resolve_lakebase_instance_name(_LAKEBASE_INSTANCE_NAME_RAW) if _LAKEBASE_INSTANCE_NAME_RAW else None
 
 SYSTEM_PROMPT = """You are a helpful assistant. Use the available tools to answer questions.
 
@@ -67,7 +80,27 @@ You have access to memory tools that allow you to remember information about use
 - Use save_user_memory to remember important facts, preferences, or details the user shares
 - Use delete_user_memory to forget specific information when asked
 
-Always check for relevant memories at the start of a conversation to provide personalized responses."""
+Always check for relevant memories at the start of a conversation to provide personalized responses.
+
+## When to save memories
+
+**Always save** when the user explicitly asks you to remember something. Trigger phrases include:
+"remember that…", "store this", "add to memory", "note that…", "from now on…"
+
+**Proactively save** when the user shares information that is likely to remain true for months or years \
+and would meaningfully improve future responses. This includes:
+- Preferences (e.g., language, framework, formatting style)
+- Role, responsibilities, or expertise
+- Ongoing projects or long-term goals
+- Recurring constraints (e.g., accessibility needs, dietary restrictions)
+
+## When NOT to save memories
+
+- Temporary or short-lived facts (e.g., "I'm tired today")
+- Trivial or one-off details (e.g., what they ate for lunch, a single troubleshooting step)
+- Highly sensitive personal information (health conditions, political affiliation, sexual orientation, \
+religion, criminal history) — unless the user explicitly asks you to store it
+- Information that could feel intrusive or overly personal to store"""
 
 
 def init_mcp_client(workspace_client: WorkspaceClient) -> DatabricksMultiServerMCPClient:
@@ -84,8 +117,13 @@ def init_mcp_client(workspace_client: WorkspaceClient) -> DatabricksMultiServerM
 
 
 async def init_agent(store: BaseStore, workspace_client: Optional[WorkspaceClient] = None):
-    mcp_client = init_mcp_client(workspace_client or sp_workspace_client)
-    tools = await mcp_client.get_tools() + memory_tools()
+    tools = [get_current_time] + memory_tools()
+    # To use MCP server tools instead, replace the line above with:
+    # mcp_client = init_mcp_client(workspace_client or sp_workspace_client)
+    # try:
+    #     tools.extend(await mcp_client.get_tools())
+    # except Exception:
+    #     logger.warning("Failed to fetch MCP tools. Continuing without MCP tools.", exc_info=True)
 
     return create_agent(
         model=ChatDatabricks(endpoint=LLM_ENDPOINT_NAME),
@@ -96,10 +134,10 @@ async def init_agent(store: BaseStore, workspace_client: Optional[WorkspaceClien
 
 
 @invoke()
-async def non_streaming(request: ResponsesAgentRequest) -> ResponsesAgentResponse:
+async def invoke_handler(request: ResponsesAgentRequest) -> ResponsesAgentResponse:
     outputs = [
         event.item
-        async for event in streaming(request)
+        async for event in stream_handler(request)
         if event.type == "response.output_item.done"
     ]
 
@@ -109,15 +147,12 @@ async def non_streaming(request: ResponsesAgentRequest) -> ResponsesAgentRespons
 
 
 @stream()
-async def streaming(
+async def stream_handler(
     request: ResponsesAgentRequest,
 ) -> AsyncGenerator[ResponsesAgentStreamEvent, None]:
     if session_id := get_session_id(request):
         mlflow.update_current_trace(metadata={"mlflow.trace.session": session_id})
-    
-    # Optionally use the user's workspace client for on-behalf-of authentication
-    # NEEDS to be initialized during query time, not on agent initialization to have user creds.
-    # user_workspace_client = get_user_workspace_client()
+
     user_id = get_user_id(request)
 
     if not user_id:
@@ -130,6 +165,8 @@ async def streaming(
     try:
         async with AsyncDatabricksStore(
             instance_name=LAKEBASE_INSTANCE_NAME,
+            project=LAKEBASE_AUTOSCALING_PROJECT,
+            branch=LAKEBASE_AUTOSCALING_BRANCH,
             embedding_endpoint=EMBEDDING_ENDPOINT,
             embedding_dims=EMBEDDING_DIMS,
         ) as store:
@@ -138,6 +175,8 @@ async def streaming(
             if user_id:
                 config["configurable"]["user_id"] = user_id
 
+            # By default, uses service principal credentials (sp_workspace_client).
+            # For on-behalf-of user authentication, use get_user_workspace_client() instead.
             agent = await init_agent(workspace_client=sp_workspace_client, store=store)
             async for event in process_agent_astream_events(
                 agent.astream(messages, config, stream_mode=["updates", "messages"])
@@ -146,9 +185,10 @@ async def streaming(
     except Exception as e:
         error_msg = str(e).lower()
         # Check for Lakebase access/connection errors
-        if any(keyword in error_msg for keyword in ["permission"]):
+        if any(keyword in error_msg for keyword in ["lakebase", "pg_hba", "postgres", "database instance"]):
             logger.error(f"Lakebase access error: {e}")
+            lakebase_desc = LAKEBASE_INSTANCE_NAME or f"{LAKEBASE_AUTOSCALING_PROJECT}/{LAKEBASE_AUTOSCALING_BRANCH}"
             raise HTTPException(
-                status_code=503, detail=get_lakebase_access_error_message(LAKEBASE_INSTANCE_NAME)
+                status_code=503, detail=get_lakebase_access_error_message(lakebase_desc)
             ) from e
         raise

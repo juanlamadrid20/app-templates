@@ -5,6 +5,8 @@ description: "Add tools to your agent and grant required permissions in databric
 
 # Add Tools & Grant Permissions
 
+> **Profile reminder:** All `databricks` CLI commands must include the profile from `.env`: `databricks <command> --profile <profile>`
+
 **After adding any MCP server to your agent, you MUST grant the app access in `databricks.yml`.**
 
 Without this, you'll get permission errors when the agent tries to use the resource.
@@ -54,6 +56,7 @@ See the `examples/` directory for complete YAML snippets:
 | `sql-warehouse.yaml` | SQL warehouse | SQL execution |
 | `serving-endpoint.yaml` | Model serving endpoint | Model inference |
 | `genie-space.yaml` | Genie space | Natural language data |
+| `lakebase-autoscaling.md` | Lakebase autoscaling postgres | Agent memory storage (autoscaling) |
 | `experiment.yaml` | MLflow experiment | Tracing (already configured) |
 | `custom-mcp-server.md` | Custom MCP apps | Apps starting with `mcp-*` |
 

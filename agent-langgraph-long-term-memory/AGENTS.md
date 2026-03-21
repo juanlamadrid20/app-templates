@@ -9,17 +9,45 @@
 
    *Note: New apps should use the `agent-*` prefix (e.g., `agent-data-analyst`) unless the user specifies otherwise.*
 
-2. **Lakebase instance (required for memory):**
-   > "This template requires Lakebase for memory. Do you have an existing Lakebase instance? If so, what's the instance name?"
+2. **Lakebase instance (required for memory) — use `AskUserQuestion` tool:**
 
-**Then check authentication status by running `databricks auth profiles`.**
+   **Step A:** Use the `AskUserQuestion` tool to ask the user which type of Lakebase instance they are using:
+   - Option 1: **Provisioned** — "I have a provisioned Lakebase instance"
+   - Option 2: **Autoscaling** — "I have an autoscaling Lakebase project/branch"
 
-This helps you understand:
-- Which Databricks profiles are configured
-- Whether authentication is already set up
-- Which profile to use for subsequent commands
+   **Step B (if Provisioned):** Use `AskUserQuestion` to ask:
+   > "What is your Lakebase instance name?"
 
-If no profiles exist or `.env` is missing, guide the user through running `uv run quickstart` to set up authentication and configuration. See the **quickstart** skill for details.
+   Then pass it to quickstart: `uv run quickstart --lakebase-provisioned-name <instance-name>`
+   For post-deploy setup, see the **lakebase-setup** skill.
+
+   **Step B (if Autoscaling):** Use `AskUserQuestion` to ask:
+   > "What is your Lakebase project and branch? You can provide them separately (project name and branch name) or paste the full resource path (e.g. `project/my-project/branch/my-branch`)."
+
+   - If the user provides a resource path like `project/<project>/branch/<branch>`, parse out the project and branch components
+   - The user may also paste just a branch resource path like `project/<project-id>/branch/<branch-id>` — parse project and branch from the path segments
+
+   Then pass to quickstart: `uv run quickstart --lakebase-autoscaling-project <project> --lakebase-autoscaling-branch <branch>`
+   For post-deploy setup (adding postgres resource via API, granting permissions), see `.claude/skills/add-tools/examples/lakebase-autoscaling.md`.
+
+**Then set up the environment using quickstart:**
+
+1. **Read the quickstart skill** at `.claude/skills/quickstart/SKILL.md` — it contains all available CLI flags (including Lakebase options), what the script configures, and fallback instructions.
+2. **Check if `.env` exists.** If it does, the environment is already configured — read it to find `DATABRICKS_CONFIG_PROFILE` and skip to verifying auth. If `.env` does not exist, run quickstart:
+   ```bash
+   uv run quickstart --profile <profile-name> --lakebase-provisioned-name <instance-name>
+   ```
+3. Run `databricks auth profiles` to verify the profile is configured and valid.
+
+**CRITICAL: All `databricks` CLI commands must include the profile from `.env`.** Either use `--profile` or set the env var:
+
+```bash
+databricks <command> --profile <profile>
+# or
+DATABRICKS_CONFIG_PROFILE=<profile> databricks <command>
+```
+
+> **Why this matters:** Without the profile, the CLI may target the wrong workspace, causing "not found" errors for experiments, apps, or other resources.
 
 ## Understanding User Goals
 
@@ -40,7 +68,7 @@ Use `uv run discover-tools` to show them available resources in their workspace,
 This template includes **long-term memory** (facts that persist across conversation sessions). The agent can remember user preferences and information across multiple interactions.
 
 **Required setup:**
-1. Configure Lakebase instance (see **lakebase-setup** skill)
+1. Configure Lakebase — follow the `AskUserQuestion` flow in MANDATORY First Actions above to determine provisioned vs autoscaling and pass the right flags to quickstart
 2. Use `user_id` in requests to scope memories per user (see **agent-memory** skill)
 
 ## Handling Deployment Errors
@@ -51,6 +79,22 @@ Ask the user: "I see there's an existing app with the same name. Would you like 
 
 - **If they want to bind**: See the **deploy** skill for binding steps
 - **If they want to delete**: Run `databricks apps delete <app-name>` then deploy again
+
+## Agent Evaluation
+
+When the user asks about evaluating their agent (quality, metrics, scorers, datasets, or tracing), suggest installing the **MLflow Skills** from https://github.com/mlflow/skills. These provide expert guidance for evaluation workflows using MLflow's native APIs.
+
+**Relevant skills:**
+- **agent-evaluation** — end-to-end evaluation: dataset creation, scorer selection, execution, result analysis
+- **instrumenting-with-mlflow-tracing** — set up automatic tracing for debugging and observability
+- **analyze-mlflow-trace** — examine span data and assessments to identify issues
+
+**Install command:**
+```bash
+npx skills add mlflow/skills
+```
+
+After installation, the skills will be available as slash commands (e.g., `/agent-evaluation`). This template also includes a built-in `evaluate_agent.py` script — run it with `uv run agent-evaluate` after starting the local server.
 
 ---
 

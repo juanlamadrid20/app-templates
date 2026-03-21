@@ -1,9 +1,9 @@
 import logging
 import os
+from datetime import datetime
 from typing import Any, AsyncGenerator, Optional, Sequence, TypedDict
 
-import uuid_utils
-
+import litellm
 import mlflow
 from databricks.sdk import WorkspaceClient
 from databricks_langchain import (
@@ -15,9 +15,8 @@ from databricks_langchain import (
 from fastapi import HTTPException
 from langchain.agents import create_agent
 from langchain_core.messages import AnyMessage
+from langchain_core.tools import tool
 from langgraph.graph.message import add_messages
-from typing_extensions import Annotated
-
 from mlflow.genai.agent_server import invoke, stream
 from mlflow.types.responses import (
     ResponsesAgentRequest,
@@ -25,28 +24,44 @@ from mlflow.types.responses import (
     ResponsesAgentStreamEvent,
     to_chat_completions_input,
 )
+from typing_extensions import Annotated
 
 from agent_server.utils import (
+    _get_lakebase_access_error_message,
+    _get_or_create_thread_id,
     get_databricks_host_from_env,
     process_agent_astream_events,
 )
 
 logger = logging.getLogger(__name__)
 mlflow.langchain.autolog()
+logging.getLogger("mlflow.utils.autologging_utils").setLevel(logging.ERROR)
+litellm.suppress_debug_info = True
 sp_workspace_client = WorkspaceClient()
+
+
+@tool
+def get_current_time() -> str:
+    """Get the current date and time."""
+    return datetime.now().isoformat()
+
 
 ############################################
 # Configuration
 ############################################
 LLM_ENDPOINT_NAME = "databricks-claude-sonnet-4-5"
 SYSTEM_PROMPT = "You are a helpful assistant. Use the available tools to answer questions."
-LAKEBASE_INSTANCE_NAME = os.getenv("LAKEBASE_INSTANCE_NAME", "")
+LAKEBASE_INSTANCE_NAME = os.getenv("LAKEBASE_INSTANCE_NAME") or None
+LAKEBASE_AUTOSCALING_PROJECT = os.getenv("LAKEBASE_AUTOSCALING_PROJECT") or None
+LAKEBASE_AUTOSCALING_BRANCH = os.getenv("LAKEBASE_AUTOSCALING_BRANCH") or None
 
-if not LAKEBASE_INSTANCE_NAME:
+_has_autoscaling = LAKEBASE_AUTOSCALING_PROJECT and LAKEBASE_AUTOSCALING_BRANCH
+if not LAKEBASE_INSTANCE_NAME and not _has_autoscaling:
     raise ValueError(
-        "LAKEBASE_INSTANCE_NAME environment variable is required but not set. "
-        "Please set it in your environment:\n"
-        "  LAKEBASE_INSTANCE_NAME=<your-lakebase-instance-name>\n"
+        "Lakebase configuration is required but not set. "
+        "Please set one of the following in your environment:\n"
+        "  Option 1 (provisioned): LAKEBASE_INSTANCE_NAME=<your-instance-name>\n"
+        "  Option 2 (autoscaling): LAKEBASE_AUTOSCALING_PROJECT=<project> and LAKEBASE_AUTOSCALING_BRANCH=<branch>\n"
     )
 
 
@@ -73,8 +88,13 @@ async def init_agent(
     workspace_client: Optional[WorkspaceClient] = None,
     checkpointer: Optional[Any] = None,
 ):
-    mcp_client = init_mcp_client(workspace_client or sp_workspace_client)
-    tools = await mcp_client.get_tools()
+    tools = [get_current_time]
+    # To use MCP server tools instead, uncomment the below lines:
+    # mcp_client = init_mcp_client(workspace_client or sp_workspace_client)
+    # try:
+    #     tools.extend(await mcp_client.get_tools())
+    # except Exception:
+    #     logger.warning("Failed to fetch MCP tools. Continuing without MCP tools.", exc_info=True)
 
     model = ChatDatabricks(endpoint=LLM_ENDPOINT_NAME)
 
@@ -87,31 +107,15 @@ async def init_agent(
     )
 
 
-def _get_or_create_thread_id(request: ResponsesAgentRequest) -> str:
-    # priority of getting thread id:
-    # 1. Use thread id from custom inputs
-    # 2. Use conversation id from ChatContext https://mlflow.org/docs/latest/api_reference/python_api/mlflow.types.html#mlflow.types.agent.ChatContext
-    # 3. Generate random UUID
-    ci = dict(request.custom_inputs or {})
-
-    if "thread_id" in ci and ci["thread_id"]:
-        return str(ci["thread_id"])
-
-    if request.context and getattr(request.context, "conversation_id", None):
-        return str(request.context.conversation_id)
-
-    return str(uuid_utils.uuid7())
-
-
 @invoke()
-async def non_streaming(request: ResponsesAgentRequest) -> ResponsesAgentResponse:
+async def invoke_handler(request: ResponsesAgentRequest) -> ResponsesAgentResponse:
     thread_id = _get_or_create_thread_id(request)
     request.custom_inputs = dict(request.custom_inputs or {})
     request.custom_inputs["thread_id"] = thread_id
 
     outputs = [
         event.item
-        async for event in streaming(request)
+        async for event in stream_handler(request)
         if event.type == "response.output_item.done"
     ]
 
@@ -119,13 +123,11 @@ async def non_streaming(request: ResponsesAgentRequest) -> ResponsesAgentRespons
 
 
 @stream()
-async def streaming(
+async def stream_handler(
     request: ResponsesAgentRequest,
 ) -> AsyncGenerator[ResponsesAgentStreamEvent, None]:
-    # workspace_client = WorkspaceClient()
-    # Optionally use the user's workspace client for on-behalf-of authentication
-    # user_workspace_client = get_user_workspace_client()
     thread_id = _get_or_create_thread_id(request)
+    mlflow.update_current_trace(metadata={"mlflow.trace.session": thread_id})
 
     config = {"configurable": {"thread_id": thread_id}}
     input_state: dict[str, Any] = {
@@ -134,7 +136,14 @@ async def streaming(
     }
 
     try:
-        async with AsyncCheckpointSaver(instance_name=LAKEBASE_INSTANCE_NAME) as checkpointer:
+        async with AsyncCheckpointSaver(
+            instance_name=LAKEBASE_INSTANCE_NAME,
+            project=LAKEBASE_AUTOSCALING_PROJECT,
+            branch=LAKEBASE_AUTOSCALING_BRANCH,
+        ) as checkpointer:
+            await checkpointer.setup()
+            # By default, uses service principal credentials.
+            # For on-behalf-of user authentication, pass get_user_workspace_client() to init_agent.
             agent = await init_agent(checkpointer=checkpointer)
 
             async for event in process_agent_astream_events(
@@ -148,36 +157,10 @@ async def streaming(
     except Exception as e:
         error_msg = str(e).lower()
         # Check for Lakebase access/connection errors
-        if any(keyword in error_msg for keyword in ["permission"]):
+        if any(keyword in error_msg for keyword in ["lakebase", "pg_hba", "postgres", "database instance"]):
             logger.error(f"Lakebase access error: {e}")
-            raise HTTPException(status_code=503, detail=_get_lakebase_access_error_message()) from e
+            lakebase_desc = LAKEBASE_INSTANCE_NAME or f"{LAKEBASE_AUTOSCALING_PROJECT}/{LAKEBASE_AUTOSCALING_BRANCH}"
+            raise HTTPException(
+                status_code=503, detail=_get_lakebase_access_error_message(lakebase_desc)
+            ) from e
         raise
-
-
-def _is_databricks_app_env() -> bool:
-    """Check if running in a Databricks App environment."""
-    return bool(os.getenv("DATABRICKS_APP_NAME"))
-
-
-def _get_lakebase_access_error_message() -> str:
-    """Generate a helpful error message for Lakebase access issues."""
-    if _is_databricks_app_env():
-        app_name = os.getenv("DATABRICKS_APP_NAME")
-        return (
-            f"Failed to connect to Lakebase instance '{LAKEBASE_INSTANCE_NAME}'. "
-            f"The App Service Principal for '{app_name}' may not have access.\n\n"
-            "To fix this:\n"
-            "1. Go to the Databricks UI and navigate to your app\n"
-            "2. Click 'Edit' → 'App resources' → 'Add resource'\n"
-            "3. Add your Lakebase instance as a resource\n"
-            "4. Grant the necessary permissions on your Lakebase instance. "
-            "See the README section 'Grant Lakebase permissions to your App's Service Principal' for the SQL commands."
-        )
-    else:
-        return (
-            f"Failed to connect to Lakebase instance '{LAKEBASE_INSTANCE_NAME}'. "
-            "Please verify:\n"
-            "1. The instance name is correct\n"
-            "2. You have the necessary permissions to access the instance\n"
-            "3. Your Databricks authentication is configured correctly"
-        )

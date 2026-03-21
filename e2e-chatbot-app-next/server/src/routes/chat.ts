@@ -11,7 +11,6 @@ import {
   generateText,
   type LanguageModelUsage,
   pipeUIMessageStreamToResponse,
-  type InferUIMessageChunk,
 } from 'ai';
 import type { LanguageModelV3Usage } from '@ai-sdk/provider';
 
@@ -62,6 +61,7 @@ import {
 } from '@chat-template/core';
 import { ChatSDKError } from '@chat-template/core/errors';
 import { storeMessageMeta } from '../lib/message-meta-store';
+import { drainStreamToWriter, fallbackToGenerateText } from '../lib/stream-fallback';
 
 export const chatRouter: RouterType = Router();
 
@@ -123,6 +123,8 @@ chatRouter.post('/', requireAuth, async (req: Request, res: Response) => {
       return res.status(response.status).json(response.json);
     }
 
+    let titlePromise: Promise<string | null> | undefined;
+
     if (!chat) {
       // Only create new chat if we have a message (not a continuation)
       if (isDatabaseAvailable() && message) {
@@ -133,24 +135,25 @@ chatRouter.post('/', requireAuth, async (req: Request, res: Response) => {
           visibility: selectedVisibilityType,
         });
 
-        generateTitleFromUserMessage({ message })
-          .then((title) =>
-            updateChatTitleById({
-              chatId: id,
-              title,
-            }),
-          )
-          .catch((error) => {
+        titlePromise = generateTitleFromUserMessage({ message })
+          .then(async (title) => {
+            await updateChatTitleById({ chatId: id, title });
+            return title;
+          })
+          .catch(async (error) => {
             console.error('Error generating title:', error);
             const textFromUserMessage = message?.parts.find(
               (part) => part.type === 'text',
             )?.text;
             if (textFromUserMessage) {
-              updateChatTitleById({
-                chatId: id,
-                title: truncatePreserveWords(textFromUserMessage, 128),
-              });
+              const fallback = truncatePreserveWords(
+                textFromUserMessage,
+                128,
+              );
+              await updateChatTitleById({ chatId: id, title: fallback });
+              return fallback;
             }
+            return null;
           });
       }
     } else {
@@ -245,17 +248,24 @@ chatRouter.post('/', requireAuth, async (req: Request, res: Response) => {
     const streamId = generateUUID();
 
     const model = await myProvider.languageModel(selectedChatModel);
+    const modelMessages = await convertToModelMessages(uiMessages);
+    const requestHeaders = {
+      [CONTEXT_HEADER_CONVERSATION_ID]: id,
+      [CONTEXT_HEADER_USER_ID]: session.user.email ?? session.user.id,
+      // Forward OBO user token to the backend/serving endpoint
+      ...(req.headers['x-forwarded-access-token']
+        ? { 'x-forwarded-access-token': req.headers['x-forwarded-access-token'] as string }
+        : {}),
+    };
+
     const result = streamText({
       model,
-      messages: await convertToModelMessages(uiMessages),
+      messages: modelMessages,
       providerOptions: {
         databricks: { includeTrace: true },
       },
       includeRawChunks: true,
-      headers: {
-        [CONTEXT_HEADER_CONVERSATION_ID]: id,
-        [CONTEXT_HEADER_USER_ID]: session.user.email ?? session.user.id,
-      },
+      headers: requestHeaders,
       onChunk: ({ chunk }) => {
         if (chunk.type === 'raw') {
           const raw = chunk.rawValue as any;
@@ -273,14 +283,15 @@ chatRouter.post('/', requireAuth, async (req: Request, res: Response) => {
           }
         }
       },
-      onFinish: (finishData) => {
-        finalUsage = finishData.usage;
+      onFinish: ({ usage }) => {
+        finalUsage = usage;
       },
     });
 
     /**
-     * We manually create the stream to have access to the stream writer.
-     * This allows us to inject custom stream parts like data-error.
+     * We manually read from toUIMessageStream instead of using writer.merge
+     * so the execute promise (and thus the outer stream) stays alive if we
+     * need to fall back to generateText after a streaming error.
      */
     const stream = createUIMessageStream({
       // Pass originalMessages so that continuation responses reuse the existing
@@ -288,6 +299,9 @@ chatRouter.post('/', requireAuth, async (req: Request, res: Response) => {
       // a fresh ID, causing the client to push a second assistant message instead
       // of replacing the existing one.
       originalMessages: uiMessages,
+      // The DB Message.id column is typed as uuid, so we must generate UUIDs
+      // rather than the AI SDK's default short-id format (e.g. "Xt8nZiQRj1fS4yiU").
+      generateId: generateUUID,
       execute: async ({ writer }) => {
         // Manually drain the AI stream so we can append the traceId data part
         // after all model chunks are processed (traceId is captured via onChunk).
@@ -296,17 +310,37 @@ chatRouter.post('/', requireAuth, async (req: Request, res: Response) => {
         // - start-step/finish-step: strips extra fields
         // - finish: strips rawFinishReason/totalUsage
         // - raw: dropped (trace_id captured via onChunk above)
-        const aiStream = result.toUIMessageStream<ChatMessage>();
-        const reader = aiStream.getReader();
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            writer.write(value as InferUIMessageChunk<ChatMessage>);
-          }
-        } finally {
-          reader.releaseLock();
+        const aiStream = result.toUIMessageStream<ChatMessage>({
+          sendReasoning: true,
+          sendSources: true,
+          sendFinish: false,
+          onError: (error) => {
+            const msg =
+              error instanceof Error ? error.message : String(error);
+            writer.onError?.(error);
+            return msg;
+          },
+        });
+
+        const { failed } = await drainStreamToWriter(aiStream, writer);
+
+        if (failed) {
+          console.log('Streaming failed, falling back to generateText...');
+          const fallbackResult = await fallbackToGenerateText(
+            { model, messages: modelMessages, headers: requestHeaders },
+            writer,
+          );
+
+          finalUsage = fallbackResult?.usage;
+          traceId = fallbackResult?.traceId ?? null;
         }
+        if (titlePromise) {
+          const generatedTitle = await titlePromise;
+          if (generatedTitle) {
+            writer.write({ type: 'data-title', data: generatedTitle });
+          }
+        }
+
         // Write traceId so the client knows whether feedback is supported.
         writer.write({ type: 'data-traceId', data: traceId });
       },
@@ -314,19 +348,23 @@ chatRouter.post('/', requireAuth, async (req: Request, res: Response) => {
         // Store in-memory for ephemeral mode (also useful when DB is available)
         storeMessageMeta(responseMessage.id, id, traceId);
 
-        await saveMessages({
-          messages: [
-            {
-              id: responseMessage.id,
-              role: responseMessage.role,
-              parts: responseMessage.parts,
-              createdAt: new Date(),
-              attachments: [],
-              chatId: id,
-              traceId, // Store trace ID for feedback
-            },
-          ],
-        });
+        try {
+          await saveMessages({
+            messages: [
+              {
+                id: responseMessage.id,
+                role: responseMessage.role,
+                parts: responseMessage.parts,
+                createdAt: new Date(),
+                attachments: [],
+                chatId: id,
+                traceId, // Store trace ID for feedback
+              },
+            ],
+          });
+        } catch (err) {
+          console.error('[onFinish] Failed to save assistant message:', err);
+        }
 
         if (finalUsage) {
           try {
@@ -576,3 +614,4 @@ function truncatePreserveWords(input: string, maxLength: number): string {
 
   return slice.slice(0, lastSpaceIndex);
 }
+
